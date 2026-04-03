@@ -86,6 +86,11 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
+    # --- Mamba SSM ---
+    ssm_d_state = int(os.environ.get("SSM_D_STATE", 16))
+    ssm_d_conv = int(os.environ.get("SSM_D_CONV", 4))
+    ssm_expand = int(os.environ.get("SSM_EXPAND", 2))
+
 # -----------------------------
 # MUON OPTIMIZER 
 # -----------------------------
@@ -289,7 +294,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,ssm_scale,ssm_scales,A_log",
     ).split(",")
     if pattern
 )
@@ -725,6 +730,185 @@ class GPT(nn.Module):
 
 
 # -----------------------------
+# MAMBA STATE-SPACE MODEL
+# -----------------------------
+# Selective SSM (Mamba-1 style), pure PyTorch with chunked scan.
+# Replaces attention blocks with linear-complexity recurrence.
+# Reference: Gu & Dao 2023 (https://arxiv.org/abs/2312.00752)
+
+_SSM_CHUNK = 64  # Fixed chunk size compiled once; L must be divisible by this or we handle remainder.
+
+
+def _scan_chunk_fn(h: Tensor, dA: Tensor, dBu: Tensor, C: Tensor) -> tuple[Tensor, Tensor]:
+    # Inner loop compiled for exactly _SSM_CHUNK steps.
+    # h: (B, d_inner, d_state), dA/dBu: (B, _SSM_CHUNK, d_inner, d_state), C: (B, _SSM_CHUNK, d_state)
+    ys = []
+    for t in range(_SSM_CHUNK):
+        h = dA[:, t] * h + dBu[:, t]
+        ys.append((h * C[:, t].unsqueeze(1)).sum(-1))
+    return h, torch.stack(ys, dim=1)
+
+
+_scan_chunk_compiled = torch.compile(_scan_chunk_fn, dynamic=False, fullgraph=True)
+
+
+@torch._dynamo.disable
+def _selective_scan(u: Tensor, dt: Tensor, A: Tensor, B: Tensor, C: Tensor) -> Tensor:
+    # Chunked scan: compute dA/dBu per chunk to avoid materialising (B,L,d_inner,d_state).
+    # u, dt: (B, L, d_inner)  A: (1,1,d_inner,d_state)  B,C: (B, L, d_state)
+    # Returns y: (B, L, d_inner)
+    B_sz, L, d_inner = u.shape
+    d_state = A.shape[-1]
+    h = u.new_zeros(B_sz, d_inner, d_state)
+    ys = []
+    n_full = L // _SSM_CHUNK
+    for ci in range(n_full):
+        s = ci * _SSM_CHUNK
+        u_c = u[:, s:s + _SSM_CHUNK]
+        dt_c = dt[:, s:s + _SSM_CHUNK]
+        B_c = B[:, s:s + _SSM_CHUNK]
+        C_c = C[:, s:s + _SSM_CHUNK]
+        dA_c = torch.exp(dt_c.unsqueeze(-1) * A)
+        dBu_c = dt_c.unsqueeze(-1) * B_c.unsqueeze(2) * u_c.unsqueeze(-1)
+        h, y_c = _scan_chunk_compiled(h, dA_c, dBu_c, C_c)
+        ys.append(y_c)
+    # Remainder (if L % _SSM_CHUNK != 0)
+    rem = L % _SSM_CHUNK
+    if rem:
+        s = n_full * _SSM_CHUNK
+        for t in range(s, L):
+            dA_t = torch.exp(dt[:, t].unsqueeze(-1) * A[:, 0])
+            dBu_t = dt[:, t].unsqueeze(-1) * B[:, t].unsqueeze(1) * u[:, t].unsqueeze(-1)
+            h = dA_t * h + dBu_t
+            ys.append((h * C[:, t].unsqueeze(1)).sum(-1).unsqueeze(1))
+        # Stack remainder already appended as (B,1,d_inner) slices
+    return torch.cat(ys, dim=1)
+
+
+class SelectiveSSM(nn.Module):
+    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+        super().__init__()
+        self.d_state = d_state
+        self.d_inner = d_model * expand
+        self.dt_rank = max(1, d_model // 16)
+        # Input: split into SSM stream and gate
+        self.in_proj = CastedLinear(d_model, 2 * self.d_inner, bias=False)
+        # Causal depthwise conv (width d_conv, causal via truncation)
+        self.conv1d = nn.Conv1d(self.d_inner, self.d_inner, d_conv,
+                                padding=d_conv - 1, groups=self.d_inner, bias=True)
+        # Input-dependent B, C, dt projections
+        self.x_proj = CastedLinear(self.d_inner, self.dt_rank + 2 * d_state, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        # dt_proj init: uniform weights, dt-range-aware bias (Mamba §4.1)
+        nn.init.uniform_(self.dt_proj.weight, -self.dt_rank ** -0.5, self.dt_rank ** -0.5)
+        dt_init = torch.exp(torch.rand(self.d_inner) * (math.log(0.1) - math.log(0.001)) + math.log(0.001))
+        self.dt_proj.bias.data.copy_(dt_init + torch.log(-torch.expm1(-dt_init)))
+        # A: log-diagonal state matrix — kept in CONTROL patterns so goes to Adam
+        A_init = torch.arange(1, d_state + 1, dtype=torch.float32).repeat(self.d_inner, 1)
+        self.A_log = nn.Parameter(torch.log(A_init))
+        # D: skip-connection scalar per channel
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+        # Output projection (zero-init so residual starts at identity)
+        self.out_proj = CastedLinear(self.d_inner, d_model, bias=False)
+        self.out_proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, L, D = x.shape
+        xz = self.in_proj(x)                                          # (B, L, 2*d_inner)
+        x_ssm, z = xz.chunk(2, dim=-1)                               # each (B, L, d_inner)
+        # Causal conv: truncate right-padding to keep only past context
+        x_ssm = F.silu(self.conv1d(x_ssm.transpose(1, 2))[..., :L]).transpose(1, 2)
+        # Input-dependent SSM params
+        x_dbl = self.x_proj(x_ssm)                                    # (B, L, dt_rank + 2*d_state)
+        dt_raw, B_ssm, C_ssm = x_dbl.split([self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = F.softplus(self.dt_proj(dt_raw.float()))                 # (B, L, d_inner) — Δ > 0
+        A = -torch.exp(self.A_log.float())                            # (d_inner, d_state) — negative
+        A_bc = A.unsqueeze(0).unsqueeze(0)                            # (1, 1, d_inner, d_state)
+        # Selective scan (chunked, runs in eager mode via @disable)
+        y = _selective_scan(x_ssm.float(), dt, A_bc, B_ssm.float(), C_ssm.float())
+        y = (y + self.D.float() * x_ssm.float()).to(x.dtype)
+        return self.out_proj(y * F.silu(z))
+
+
+class MambaBlock(nn.Module):
+    def __init__(self, dim: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.ssm = SelectiveSSM(dim, d_state, d_conv, expand)
+        self.ssm_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        mix = self.resid_mix.to(dtype=x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        return x + self.ssm_scale.to(dtype=x.dtype)[None, None, :] * self.ssm(self.norm(x))
+
+
+class MambaGPT(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        num_layers: int,
+        model_dim: int,
+        tie_embeddings: bool,
+        tied_embed_init_std: float,
+        logit_softcap: float,
+        d_state: int,
+        d_conv: int,
+        expand: int,
+    ):
+        super().__init__()
+        if logit_softcap <= 0.0:
+            raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        self.tie_embeddings = tie_embeddings
+        self.tied_embed_init_std = tied_embed_init_std
+        self.logit_softcap = logit_softcap
+        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        # U-Net skip connections (encoder stores, decoder reuses in reverse)
+        self.num_encoder_layers = num_layers // 2
+        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        n_skip = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.skip_weights = nn.Parameter(torch.ones(n_skip, model_dim, dtype=torch.float32))
+        self.blocks = nn.ModuleList([
+            MambaBlock(model_dim, d_state, d_conv, expand)
+            for _ in range(num_layers)
+        ])
+        self.final_norm = RMSNorm()
+        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        if self.lm_head is not None:
+            self.lm_head._zero_init = True
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        if self.tie_embeddings:
+            nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        for m in self.modules():
+            if isinstance(m, nn.Linear) and getattr(m, "_zero_init", False):
+                nn.init.zeros_(m.weight)
+
+    def _body(self, input_ids: Tensor) -> Tensor:
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return self.final_norm(x)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        x = self._body(input_ids).reshape(-1, self.tok_emb.embedding_dim)
+        targets = target_ids.reshape(-1)
+        logits_proj = F.linear(x, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
+
+
+# -----------------------------
 # TRAINING
 # -----------------------------
 
@@ -823,24 +1007,22 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    base_model = GPT(
+    base_model = MambaGPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
         model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
-        qk_gain_init=args.qk_gain_init,
+        d_state=args.ssm_d_state,
+        d_conv=args.ssm_d_conv,
+        expand=args.ssm_expand,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=True)  # fullgraph disabled: SSM scan uses @dynamo.disable
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -854,11 +1036,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params = [
-        p
-        for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-    ]
+    _matrix_ids = {id(p) for p in matrix_params}
+    scalar_params = [p for _, p in block_named_params if id(p) not in _matrix_ids]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -896,7 +1075,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"arch:mamba num_layers:{args.num_layers} d_state:{args.ssm_d_state} expand:{args.ssm_expand} d_conv:{args.ssm_d_conv}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
