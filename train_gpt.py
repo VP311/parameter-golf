@@ -838,10 +838,17 @@ class MambaBlock(nn.Module):
         self.ssm_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def _inner(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         return x + self.ssm_scale.to(dtype=x.dtype)[None, None, :] * self.ssm(self.norm(x))
+
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+        # Gradient checkpointing: don't store scan intermediates for backward.
+        # Recomputes the block on backward pass, trading ~20% extra FLOPs for ~14x less activation memory.
+        if self.training:
+            return torch.utils.checkpoint.checkpoint(self._inner, x, x0, use_reentrant=False)
+        return self._inner(x, x0)
 
 
 class MambaGPT(nn.Module):
