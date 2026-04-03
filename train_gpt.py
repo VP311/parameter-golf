@@ -798,7 +798,7 @@ class SelectiveSSM(nn.Module):
                                 padding=d_conv - 1, groups=self.d_inner, bias=True)
         # Input-dependent B, C, dt projections
         self.x_proj = CastedLinear(self.d_inner, self.dt_rank + 2 * d_state, bias=False)
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        self.dt_proj = CastedLinear(self.dt_rank, self.d_inner, bias=True)
         # dt_proj init: uniform weights, dt-range-aware bias (Mamba §4.1)
         nn.init.uniform_(self.dt_proj.weight, -self.dt_rank ** -0.5, self.dt_rank ** -0.5)
         dt_init = torch.exp(torch.rand(self.d_inner) * (math.log(0.1) - math.log(0.001)) + math.log(0.001))
@@ -821,11 +821,11 @@ class SelectiveSSM(nn.Module):
         # Input-dependent SSM params
         x_dbl = self.x_proj(x_ssm)                                    # (B, L, dt_rank + 2*d_state)
         dt_raw, B_ssm, C_ssm = x_dbl.split([self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = F.softplus(self.dt_proj(dt_raw.float()))                 # (B, L, d_inner) — Δ > 0
-        A = -torch.exp(self.A_log.float())                            # (d_inner, d_state) — negative
+        dt = F.softplus(self.dt_proj(dt_raw))                         # (B, L, d_inner) — Δ > 0, bfloat16
+        A = -torch.exp(self.A_log.float())                            # (d_inner, d_state) — negative, float32
         A_bc = A.unsqueeze(0).unsqueeze(0)                            # (1, 1, d_inner, d_state)
-        # Selective scan (chunked, runs in eager mode via @disable)
-        y = _selective_scan(x_ssm.float(), dt, A_bc, B_ssm.float(), C_ssm.float())
+        # Selective scan — everything promoted to float32 for numerical stability
+        y = _selective_scan(x_ssm.float(), dt.float(), A_bc, B_ssm.float(), C_ssm.float())
         y = (y + self.D.float() * x_ssm.float()).to(x.dtype)
         return self.out_proj(y * F.silu(z))
 
